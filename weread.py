@@ -90,6 +90,7 @@ def get_table_of_contents():
 
 
 def get_heading(level, content):
+     content = content[:2000] 
     if level == 1:
         heading = "heading_1"
     elif level == 2:
@@ -112,6 +113,7 @@ def get_heading(level, content):
 
 
 def get_quote(content):
+    content = content[:2000] 
     return {
         "type": "quote",
         "quote": {
@@ -128,6 +130,7 @@ def get_quote(content):
 
 def get_callout(content, style, colorStyle, reviewId):
     # 根据不同的划线样式设置不同的emoji 直线type=0 背景颜色是1 波浪线是2
+    content = content[:2000]
     emoji = "🌟"
     if style == 0:
         emoji = "💡"
