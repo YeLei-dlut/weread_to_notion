@@ -90,7 +90,7 @@ def get_table_of_contents():
 
 
 def get_heading(level, content):
-     content = content[:2000] 
+    content = content[:2000] 
     if level == 1:
         heading = "heading_1"
     elif level == 2:
