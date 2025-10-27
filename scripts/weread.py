@@ -4,7 +4,6 @@ import logging
 import os
 import re
 import time
-from notion_client import Client
 import requests
 from requests.utils import cookiejar_from_dict
 from http.cookies import SimpleCookie
@@ -37,6 +36,18 @@ WEREAD_READ_INFO_URL = "https://weread.qq.com/web/book/readinfo"
 WEREAD_REVIEW_LIST_URL = "https://weread.qq.com/web/review/list"
 WEREAD_BOOK_INFO = "https://weread.qq.com/web/book/info"
 
+# Notion API 配置
+NOTION_API_BASE = "https://api.notion.com/v1"
+NOTION_VERSION = "2022-06-28"
+
+def get_notion_headers():
+    """获取 Notion API 请求头"""
+    notion_token = os.getenv("NOTION_TOKEN")
+    return {
+        "Authorization": f"Bearer {notion_token}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json"
+    }
 
 def parse_cookie_string(cookie_string):
     cookie = SimpleCookie()
@@ -108,13 +119,29 @@ def get_review_list(bookId):
 
 def check(bookId):
     """检查是否已经插入过 如果已经插入了就删除"""
-    filter = {"property": "BookId", "rich_text": {"equals": bookId}}
-    response = client.databases.query_database(database_id=database_id, filter=filter)
-    for result in response["results"]:
-        try:
-            client.blocks.delete(block_id=result["id"])
-        except Exception as e:
-            print(f"删除块时出错: {e}")
+    url = f"{NOTION_API_BASE}/databases/{database_id}/query"
+    headers = get_notion_headers()
+    data = {
+        "filter": {
+            "property": "BookId", 
+            "rich_text": {"equals": bookId}
+        }
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, json=data)
+        response.raise_for_status()
+        data = response.json()
+        for result in data.get("results", []):
+            try:
+                # 归档页面而不是直接删除
+                archive_url = f"{NOTION_API_BASE}/pages/{result['id']}"
+                archive_data = {"archived": True}
+                requests.patch(archive_url, headers=headers, json=archive_data)
+            except Exception as e:
+                print(f"删除块时出错: {e}")
+    except Exception as e:
+        print(f"查询数据库时出错: {e}")
 
 @retry(stop_max_attempt_number=3, wait_fixed=5000,retry_on_exception=refresh_token)
 def get_chapter_info(bookId):
@@ -137,6 +164,7 @@ def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, catego
     """插入到notion"""
     if not cover or not cover.startswith("http"):
         cover = "https://www.notion.so/icons/book_gray.svg"
+    
     parent = {"database_id": database_id, "type": "database_id"}
     properties = {
         "BookName": get_title(bookName),
@@ -152,6 +180,7 @@ def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, catego
     }
     if categories != None:
         properties["Categories"] = get_multi_select(categories)
+    
     read_info = get_read_info(bookId=bookId)
     if read_info != None:
         markedStatus = read_info.get("markedStatus", 0)
@@ -175,28 +204,67 @@ def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, catego
             )
 
     icon = get_icon(cover)
-    # notion api 限制100个block
-    response = client.pages.create(parent=parent, icon=icon,cover=icon, properties=properties)
-    id = response["id"]
-    return id
+    
+    # 使用 requests 创建页面
+    url = f"{NOTION_API_BASE}/pages"
+    headers = get_notion_headers()
+    data = {
+        "parent": parent,
+        "icon": icon,
+        "cover": icon,
+        "properties": properties
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, json=data)
+        response.raise_for_status()
+        result = response.json()
+        return result["id"]
+    except Exception as e:
+        print(f"创建页面时出错: {e}")
+        return None
 
 
 def add_children(id, children):
+    """添加子块"""
     results = []
+    headers = get_notion_headers()
+    
     for i in range(0, len(children) // 100 + 1):
         time.sleep(0.3)
-        response = client.blocks.children.append(
-            block_id=id, children=children[i * 100 : (i + 1) * 100]
-        )
-        results.extend(response.get("results"))
+        url = f"{NOTION_API_BASE}/blocks/{id}/children"
+        data = {
+            "children": children[i * 100 : (i + 1) * 100]
+        }
+        
+        try:
+            response = requests.patch(url, headers=headers, json=data)
+            response.raise_for_status()
+            result = response.json()
+            results.extend(result.get("results", []))
+        except Exception as e:
+            print(f"添加子块时出错: {e}")
+    
     return results if len(results) == len(children) else None
 
 
 def add_grandchild(grandchild, results):
+    """添加孙块"""
+    headers = get_notion_headers()
+    
     for key, value in grandchild.items():
         time.sleep(0.3)
-        id = results[key].get("id")
-        client.blocks.children.append(block_id=id, children=[value])
+        if key < len(results):
+            id = results[key].get("id")
+            if id:
+                url = f"{NOTION_API_BASE}/blocks/{id}/children"
+                data = {
+                    "children": [value]
+                }
+                try:
+                    requests.patch(url, headers=headers, json=data)
+                except Exception as e:
+                    print(f"添加孙块时出错: {e}")
 
 
 def get_notebooklist():
@@ -215,19 +283,32 @@ def get_notebooklist():
 
 def get_sort():
     """获取database中的最新时间"""
-    filter = {"property": "Sort", "number": {"is_not_empty": True}}
-    sorts = [
-        {
-            "property": "Sort",
-            "direction": "descending",
-        }
-    ]
-    response = client.databases.query_database(
-    database_id=database_id, filter=filter, sorts=sorts, page_size=1
-)
-    if len(response.get("results")) == 1:
-        return response.get("results")[0].get("properties").get("Sort").get("number")
-    return 0
+    url = f"{NOTION_API_BASE}/databases/{database_id}/query"
+    headers = get_notion_headers()
+    data = {
+        "filter": {
+            "property": "Sort", 
+            "number": {"is_not_empty": True}
+        },
+        "sorts": [
+            {
+                "property": "Sort",
+                "direction": "descending"
+            }
+        ],
+        "page_size": 1
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, json=data)
+        response.raise_for_status()
+        data = response.json()
+        if len(data.get("results", [])) == 1:
+            return data["results"][0]["properties"]["Sort"]["number"]
+        return 0
+    except Exception as e:
+        print(f"获取排序时出错: {e}")
+        return 0
 
 
 def get_children(chapter, summary, bookmark_list):
@@ -391,10 +472,8 @@ if __name__ == "__main__":
     options = parser.parse_args()
     weread_cookie = get_cookie()
     database_id = extract_page_id()
-    notion_token = os.getenv("NOTION_TOKEN")
     session = requests.Session()
     session.cookies = parse_cookie_string(weread_cookie)
-    client = Client(auth=notion_token, log_level=logging.ERROR)
     session.get(WEREAD_URL)
     latest_sort = get_sort()
     books = get_notebooklist()
@@ -417,6 +496,9 @@ if __name__ == "__main__":
             id = insert_to_notion(
                 title, bookId, cover, sort, author, isbn, rating, categories
             )
+            if id is None:
+                print(f"创建页面失败，跳过 {title}")
+                continue
             chapter = get_chapter_info(bookId)
             bookmark_list = get_bookmark_list(bookId)
             summary, reviews = get_review_list(bookId)
